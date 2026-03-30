@@ -1,126 +1,132 @@
 import streamlit as st
-import numpy as np
 import librosa
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.signal import correlate
-import tempfile
 
-st.set_page_config(page_title="Gender Classification App", layout="centered")
-st.title("Sound Signal Analysis and Gender Classification")
+# Page Settings
+st.set_page_config(page_title="Acoustic Research & Classification", layout="wide")
 
-st.write("Bir WAV dosyası yükle. Sistem F0 hesaplayıp sınıf tahmini yapsın.")
-
-def frame_signal(y, frame_length, hop_length):
-    frames = []
-    for i in range(0, len(y) - frame_length, hop_length):
-        frames.append(y[i:i+frame_length])
-    return frames
-
-def short_time_energy(frame):
-    return np.sum(frame ** 2) / len(frame)
-
-def zero_crossing_rate(frame):
-    return np.sum(np.abs(np.diff(np.sign(frame)))) / (2 * len(frame))
-
-def autocorr_f0(frame, sr, fmin=80, fmax=400):
-    frame = frame - np.mean(frame)
-
-    if np.all(frame == 0):
-        return np.nan
-
-    corr = correlate(frame, frame, mode="full")
-    corr = corr[len(corr)//2:]
-
-    min_lag = int(sr / fmax)
-    max_lag = int(sr / fmin)
-
-    if max_lag >= len(corr) or min_lag >= max_lag:
-        return np.nan
-
-    corr_range = corr[min_lag:max_lag]
-
-    if len(corr_range) == 0:
-        return np.nan
-
-    peak = np.argmax(corr_range) + min_lag
-
-    if peak <= 0:
-        return np.nan
-
-    return sr / peak
-
-def extract_features(file_path):
-    y, sr = librosa.load(file_path, sr=None)
-
-    if len(y) == 0:
-        return np.nan, np.nan, np.nan, 0
-
-    y = y / (np.max(np.abs(y)) + 1e-8)
-
-    frame_length = int(0.03 * sr)   # 30 ms
-    hop_length = int(0.015 * sr)    # 15 ms
-
-    frames = frame_signal(y, frame_length, hop_length)
-
-    if len(frames) == 0:
-        return np.nan, np.nan, np.nan, sr
-
-    energies = np.array([short_time_energy(f) for f in frames])
-    zcrs = np.array([zero_crossing_rate(f) for f in frames])
-
-    energy_threshold = 0.3 * np.max(energies)
-    zcr_threshold = np.median(zcrs)
-
-    voiced_idx = np.where((energies > energy_threshold) & (zcrs <= zcr_threshold))[0]
-
-    f0_values = []
-    for i in voiced_idx:
-        f0 = autocorr_f0(frames[i], sr)
-        if not np.isnan(f0):
-            f0_values.append(f0)
-
-    f0_mean = np.mean(f0_values) if len(f0_values) > 0 else np.nan
-    zcr_mean = np.mean(zcrs) if len(zcrs) > 0 else np.nan
-    energy_mean = np.mean(energies) if len(energies) > 0 else np.nan
-
-    return f0_mean, zcr_mean, energy_mean, sr
-
-def classify_rule(f0):
-    if np.isnan(f0):
-        return "Unknown"
-    elif f0 < 180:
-        return "Male"
-    elif f0 < 300:
-        return "Female"
-    else:
-        return "Child"
-
-uploaded_file = st.file_uploader("WAV dosyası yükle", type=["wav"])
-
-if uploaded_file is not None:
-    st.audio(uploaded_file, format="audio/wav")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        temp_path = tmp_file.name
-
+def analyze_audio(file):
     try:
-        f0_mean, zcr_mean, energy_mean, sr = extract_features(temp_path)
-        prediction = classify_rule(f0_mean)
+        y, sr = librosa.load(file, sr=None)
+        y = y / (np.max(np.abs(y)) + 1e-8)
+        frame_len = int(0.03 * sr)
+        hop_len = int(0.015 * sr)
+        frames = [y[i:i+frame_len] for i in range(0, len(y)-frame_len, hop_len)]
+        f0_values = []
+        energies = [np.sum(f**2)/len(f) for f in frames]
+        energy_thresh = 0.2 * np.max(energies)
+        f0_track = []
+        for frame in frames:
+            energy = np.sum(frame**2)/len(frame)
+            if energy > energy_thresh:
+                f_det = frame - np.mean(frame)
+                corr = correlate(f_det, f_det, mode='full')[len(frame)-1:]
+                low, high = int(sr/500), int(sr/75)
+                if len(corr) > high:
+                    peak = np.argmax(corr[low:high]) + low
+                    freq = sr / peak
+                    f0_values.append(freq)
+                    f0_track.append(freq)
+                else: f0_track.append(np.nan)
+            else: f0_track.append(np.nan)
+        return (np.mean(f0_values) if f0_values else 0), y, sr, f0_track
+    except: return 0, None, 0, []
 
-        st.subheader("Sonuç")
-        st.write(f"Tahmin edilen sınıf: **{prediction}**")
-        st.write(f"Ortalama F0: **{f0_mean:.2f} Hz**" if not np.isnan(f0_mean) else "Ortalama F0: hesaplanamadı")
-        st.write(f"Ortalama ZCR: **{zcr_mean:.4f}**" if not np.isnan(zcr_mean) else "Ortalama ZCR: hesaplanamadı")
-        st.write(f"Ortalama Energy: **{energy_mean:.6f}**" if not np.isnan(energy_mean) else "Ortalama Energy: hesaplanamadı")
-        st.write(f"Sampling Rate: **{sr} Hz**")
+def get_meta_from_name(fname):
+    parts = fname.replace(".wav", "").split("_")
+    actual, age, emotion = "Unknown", "Unknown", "Unknown"
+    if len(parts) >= 5:
+        g_code = parts[2].upper()
+        if g_code in ["M", "E"]: actual = "Male"
+        elif g_code in ["F", "K"]: actual = "Female"
+        elif g_code == "C": actual = "Child"
+        age = parts[3]
+        emotion = parts[4].capitalize()
+    return actual, age, emotion
 
-        if prediction == "Unknown":
-            st.warning("Bu dosyada güvenilir F0 çıkarılamadı.")
-        else:
-            st.success("Analiz tamamlandı.")
+# --- UI HEADER ---
+st.title("Acoustic Signal Analysis & Speaker Classification")
+st.markdown("---")
 
-    except Exception as e:
-        st.error(f"Hata oluştu: {e}")
+# Sidebar
+st.sidebar.header("Data Input")
+uploaded_files = st.sidebar.file_uploader("Upload Audio Files", type=["wav"], accept_multiple_files=True)
 
-        ## python -m streamlit run app.py çalıştırmak için
-        ## Ctrl+c durdurmak için
+if uploaded_files:
+    results_list = []
+    file_objects = {}
+    correct_count = 0
+    
+    for file in uploaded_files:
+        f0, sig, sr, track = analyze_audio(file)
+        actual, age, emotion = get_meta_from_name(file.name)
+        
+        if f0 < 170: pred = "Male"
+        elif f0 < 290: pred = "Female"
+        else: pred = "Child"
+        
+        is_match = (pred == actual)
+        if is_match: correct_count += 1
+        
+        results_list.append({
+            "File Name": file.name,
+            "Predicted": pred,
+            "Actual": actual,
+            "F0 Mean (Hz)": round(f0, 2),
+            "Age": age,
+            "Emotion": emotion,
+            "Match": "✅" if is_match else "❌"
+        })
+        file_objects[file.name] = (f0, sig, sr, track, pred, actual, age, emotion)
+
+    df = pd.DataFrame(results_list)
+    current_accuracy = (correct_count / len(uploaded_files)) * 100
+
+    # --- TOP METRICS ---
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Files", len(uploaded_files))
+    m2.metric("Current Batch Accuracy", f"{current_accuracy:.2f}%")
+    m3.metric("Project Goal Accuracy", "76.99%")
+    m4.metric("Correct Predictions", f"{correct_count} / {len(uploaded_files)}")
+
+    st.markdown("---")
+    st.subheader("Batch Classification Breakdown")
+    st.bar_chart(df['Predicted'].value_counts())
+    st.dataframe(df, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("Detailed Signal Visualization")
+    selected_file = st.selectbox("Select a file to inspect:", options=list(file_objects.keys()))
+
+    if selected_file:
+        f0_s, sig_s, sr_s, track_s, pred_s, actual_s, age_s, emot_s = file_objects[selected_file]
+        cl, cr = st.columns([2, 1])
+        with cl:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+            plt.subplots_adjust(hspace=0.3)
+            ax1.plot(np.linspace(0, len(sig_s)/sr_s, len(sig_s)), sig_s, color='#34495e')
+            ax1.set_title("Waveform")
+            ax2.scatter(np.linspace(0, len(sig_s)/sr_s, len(track_s)), track_s, color='#e74c3c', s=2)
+            ax2.set_title("Frequency Tracking (Hz)")
+            st.pyplot(fig)
+        with cr:
+            # İSTEDİĞİN EKLEME BURADA:
+            st.info(f"**Analysis Results**")
+            st.write(f"**Calculated F0:** `{f0_s:.2f} Hz`")
+            st.write(f"**Predicted Class:** `{pred_s}`")
+            st.write(f"**Actual Gender:** `{actual_s}`")
+            st.write(f"**Subject Age:** `{age_s}`")
+            st.write(f"**Detected Emotion:** `{emot_s}`")
+            st.write("---")
+            if pred_s == actual_s:
+                st.success("✅ Prediction Match")
+            else:
+                st.error("❌ Prediction Mismatch")
+else:
+    st.info("Please upload multiple .wav files to see the results and accuracy.")
+    
+    # streamlit run app.py çalıştırma
+    # ctrl+c durdurma
