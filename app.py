@@ -1,93 +1,126 @@
 import streamlit as st
-import librosa
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+import librosa
 from scipy.signal import correlate
+import tempfile
 
-# Sayfa ayarları
-st.set_page_config(page_title="Signal Analysis Pro", layout="wide")
+st.set_page_config(page_title="Gender Classification App", layout="centered")
+st.title("Sound Signal Analysis and Gender Classification")
 
-def analyze_audio(file):
-    y, sr = librosa.load(file, sr=None)
+st.write("Bir WAV dosyası yükle. Sistem F0 hesaplayıp sınıf tahmini yapsın.")
+
+def frame_signal(y, frame_length, hop_length):
+    frames = []
+    for i in range(0, len(y) - frame_length, hop_length):
+        frames.append(y[i:i+frame_length])
+    return frames
+
+def short_time_energy(frame):
+    return np.sum(frame ** 2) / len(frame)
+
+def zero_crossing_rate(frame):
+    return np.sum(np.abs(np.diff(np.sign(frame)))) / (2 * len(frame))
+
+def autocorr_f0(frame, sr, fmin=80, fmax=400):
+    frame = frame - np.mean(frame)
+
+    if np.all(frame == 0):
+        return np.nan
+
+    corr = correlate(frame, frame, mode="full")
+    corr = corr[len(corr)//2:]
+
+    min_lag = int(sr / fmax)
+    max_lag = int(sr / fmin)
+
+    if max_lag >= len(corr) or min_lag >= max_lag:
+        return np.nan
+
+    corr_range = corr[min_lag:max_lag]
+
+    if len(corr_range) == 0:
+        return np.nan
+
+    peak = np.argmax(corr_range) + min_lag
+
+    if peak <= 0:
+        return np.nan
+
+    return sr / peak
+
+def extract_features(file_path):
+    y, sr = librosa.load(file_path, sr=None)
+
+    if len(y) == 0:
+        return np.nan, np.nan, np.nan, 0
+
     y = y / (np.max(np.abs(y)) + 1e-8)
-    
-    # 30ms Windowing [cite: 23]
-    frame_len = int(0.03 * sr)
-    hop_len = int(0.015 * sr)
-    frames = [y[i:i+frame_len] for i in range(0, len(y)-frame_len, hop_len)]
-    
+
+    frame_length = int(0.03 * sr)   # 30 ms
+    hop_length = int(0.015 * sr)    # 15 ms
+
+    frames = frame_signal(y, frame_length, hop_length)
+
+    if len(frames) == 0:
+        return np.nan, np.nan, np.nan, sr
+
+    energies = np.array([short_time_energy(f) for f in frames])
+    zcrs = np.array([zero_crossing_rate(f) for f in frames])
+
+    energy_threshold = 0.3 * np.max(energies)
+    zcr_threshold = np.median(zcrs)
+
+    voiced_idx = np.where((energies > energy_threshold) & (zcrs <= zcr_threshold))[0]
+
     f0_values = []
-    energies = [np.sum(f**2)/len(f) for f in frames]
-    energy_thresh = 0.2 * np.max(energies)
+    for i in voiced_idx:
+        f0 = autocorr_f0(frames[i], sr)
+        if not np.isnan(f0):
+            f0_values.append(f0)
 
-    for frame in frames:
-        if (np.sum(frame**2)/len(frame)) > energy_thresh:
-            f_det = frame - np.mean(frame)
-            # Autocorrelation Rτ = x[n]x[n-τ] [cite: 28, 29]
-            corr = correlate(f_det, f_det, mode='full')[len(frame)-1:]
-            low, high = int(sr/500), int(sr/75)
-            if len(corr) > high:
-                peak = np.argmax(corr[low:high]) + low
-                f0_values.append(sr / peak)
-    
-    f0_mean = np.mean(f0_values) if f0_values else 0
-    return f0_mean, y, sr
+    f0_mean = np.mean(f0_values) if len(f0_values) > 0 else np.nan
+    zcr_mean = np.mean(zcrs) if len(zcrs) > 0 else np.nan
+    energy_mean = np.mean(energies) if len(energies) > 0 else np.nan
 
-# --- UI TASARIMI ---
-st.title("🎙️ Speech Analysis & Classification Dashboard")
-st.markdown("---")
+    return f0_mean, zcr_mean, energy_mean, sr
 
-# Sol panel: Dosya Yükleme
-with st.sidebar:
-    st.header("Settings")
-    uploaded_file = st.file_uploader("Upload WAV File", type=["wav"])
-    st.info("Method: Autocorrelation (Time-Domain) [cite: 32]")
+def classify_rule(f0):
+    if np.isnan(f0):
+        return "Unknown"
+    elif f0 < 180:
+        return "Male"
+    elif f0 < 300:
+        return "Female"
+    else:
+        return "Child"
 
-if uploaded_file:
-    # Analizi çalıştır
-    f0, signal, sr = analyze_audio(uploaded_file)
-    
-    # Sınıflandırma Mantığı (Senin Eşiklerin)
-    if f0 < 170: 
-        label, color = "MALE", "blue"
-    elif f0 < 290: 
-        label, color = "FEMALE", "pink"
-    else: 
-        label, color = "CHILD", "green"
+uploaded_file = st.file_uploader("WAV dosyası yükle", type=["wav"])
 
-    # Üst Kısım: Sonuç Kartları
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Predicted Class", label)
-    col2.metric("Average F0", f"{f0:.2f} Hz")
-    col3.metric("Sample Rate", f"{sr} Hz")
+if uploaded_file is not None:
+    st.audio(uploaded_file, format="audio/wav")
 
-    st.markdown("---")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        temp_path = tmp_file.name
 
-    # Orta Kısım: Grafik ve Tablo
-    c1, c2 = st.columns([2, 1])
+    try:
+        f0_mean, zcr_mean, energy_mean, sr = extract_features(temp_path)
+        prediction = classify_rule(f0_mean)
 
-    with c1:
-        st.subheader("Waveform Analysis")
-        fig, ax = plt.subplots(figsize=(10, 3))
-        ax.plot(np.linspace(0, len(signal)/sr, len(signal)), signal, color='gray')
-        ax.set_title("Time Domain Signal")
-        st.pyplot(fig)
+        st.subheader("Sonuç")
+        st.write(f"Tahmin edilen sınıf: **{prediction}**")
+        st.write(f"Ortalama F0: **{f0_mean:.2f} Hz**" if not np.isnan(f0_mean) else "Ortalama F0: hesaplanamadı")
+        st.write(f"Ortalama ZCR: **{zcr_mean:.4f}**" if not np.isnan(zcr_mean) else "Ortalama ZCR: hesaplanamadı")
+        st.write(f"Ortalama Energy: **{energy_mean:.6f}**" if not np.isnan(energy_mean) else "Ortalama Energy: hesaplanamadı")
+        st.write(f"Sampling Rate: **{sr} Hz**")
 
-    with c2:
-        st.subheader("Analysis Summary")
-        # Tablomsu yapı burada
-        stats_data = {
-            "Parameter": ["Fundamental Freq (F0)", "Classification", "Signal Status"],
-            "Value": [f"{f0:.2f} Hz", label, "Processed"],
-            "Status": ["✅", "🎯", "⚡"]
-        }
-        st.table(pd.DataFrame(stats_data))
+        if prediction == "Unknown":
+            st.warning("Bu dosyada güvenilir F0 çıkarılamadı.")
+        else:
+            st.success("Analiz tamamlandı.")
 
-    # Alt Kısım: Teknik Detay
-    with st.expander("See Mathematical Details"):
-        st.write("Fundamental frequency (F0) is calculated only on voiced regions[cite: 25, 40].")
-        st.latex(r"R(\tau) = \sum_{n} x[n]x[n-\tau]") # Otokorelasyon formülü 
+    except Exception as e:
+        st.error(f"Hata oluştu: {e}")
 
-else:
-    st.warning("Please upload a .wav file from the sidebar to begin analysis.")
+        ## python -m streamlit run app.py çalıştırmak için
+        ## Ctrl+c durdurmak için
